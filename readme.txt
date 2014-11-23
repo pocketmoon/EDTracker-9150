@@ -7,10 +7,11 @@ copy to edtracker.zip  to Arduino/hardware/  and unzip
 So should end up with
 
 
-Arduino/Hardware/edtracker/...   etc
+	Arduino/Hardware/edtracker/...   etc
+
+
 
 In Arduino IDE select Tools->Board->Edtracker EDTracker 2
-
 
 
 These sketches use a fork of Richard Barnett's sensor fusion library (originals available here https://github.com/richards-tech/RTIMULib-Arduino)
