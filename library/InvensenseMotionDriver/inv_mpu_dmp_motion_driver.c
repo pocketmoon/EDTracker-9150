@@ -1185,7 +1185,7 @@ static int decode_gesture(unsigned char *gesture)
  -6:  Quaternion out of range (I2C corruption?)
  */
 void  dmp_read_fifo(short *gyro, short *accel, long *quat,
-    unsigned long *timestamp, short *sensors, unsigned char *more)
+    unsigned char *timestamp, short *sensors, unsigned char *more)
 {
     unsigned char fifo_data[MAX_PACKET_LENGTH];
     unsigned char ii = 0;

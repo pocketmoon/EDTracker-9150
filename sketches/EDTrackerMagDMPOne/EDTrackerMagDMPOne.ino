@@ -1,7 +1,7 @@
 //
 //  Head Tracker Sketch
 //
-const char  infoString []   = "EDTrackerMag V4.0.1";
+const char  infoString []   = "EDTrackerMag V4.0.3";
 
 //
 // Changelog:
@@ -10,6 +10,9 @@ const char  infoString []   = "EDTrackerMag V4.0.1";
 //            drift adjustment
 // 2014-12-24 Implements startup auto calibration and new magnetometer drift compensation
 // 2015-01-25 Fix mag wraping/clamping.
+// 2015-02-13 Fix mag heading average when heading is close to +/- PI boundary
+//            Fix incorrect roll compensation for mag heading
+// 2015-03-01 Fix smoothing val not being saved to EEPROM
 /* ============================================
 EDTracker device code is placed under the MIT License
 
@@ -66,7 +69,7 @@ float xDriftComp = 0.0;
 // 1 byte
 #define EE_ORIENTATION 25
 // 2 bytes
-#define EE_XDRIFTCOMP 26
+#define EE_LPF 26
 
 //0 for linear, 1 for exponential
 #define EE_EXPSCALEMODE 28
@@ -94,7 +97,7 @@ float xDriftComp = 0.0;
 #define EE_MAGXFORM     50
 
 float magOffset[3];
-float magXform[12];
+float magXform[18];
 
 #define SDA_PIN 2
 #define SCL_PIN 3
@@ -129,17 +132,18 @@ int   sampleCount = 0;
 boolean calibrated = true;
 
 //Number of samples to take when recalibrating
-byte  recalibrateSamples =  1000;
+byte  recalibrateSamples =  255;
 
 // Holds the time since sketch stared
 unsigned long  nowMillis;
 boolean blinkState;
 
-float magHeading, lastMagHeading;
+float magHeading, lastMagHeading,   rawMagHeading;
+;
 int consecCount = 0;
 
 boolean behind = false;
-
+boolean offsetMag = false;
 TrackState_t joySt;
 
 /* The mounting matrix below tells the MPL how to rotate the raw
@@ -148,13 +152,12 @@ TrackState_t joySt;
 
 static byte gyro_orients[6] =
 {
-  B10001000, // Z Up X Forward
-  B10000101, // X right
-  B10101100, // X Back
-  B10100001, // X Left
-  B01010100, // left ear
-  B01110000  // right ear
+  B10001000, // right
+  B10000101, // front
+  B10101100, // left
+  B10100001 // rear
 }; //ZYX
+
 
 byte orientation = 2;
 
@@ -222,13 +225,15 @@ void setup() {
 /****************************************
 * Gyro/Accel/DMP Configuration
 ****************************************/
-#define PI 3.141592654
+#define PI    32768.0
+#define TWOPI 65536.0
+
 float wrap(float angle)
 {
   if (angle > PI)
-    angle -= (2 * PI);
+    angle -= (TWOPI);
   if (angle < -PI)
-    angle += (2 * PI);
+    angle += (TWOPI);
   return angle;
 }
 
@@ -239,319 +244,343 @@ void recenter()
     Serial.println("M\tR");
   }
   sampleCount = 0;
+
   for (int i = 0; i < 4; i++)
     c[i] = 0.0;
+
   calibrated = false;
+  offsetMag = false;
+
+  if (rawMagHeading > 28000.0  || rawMagHeading < -28000.0)
+    offsetMag = true;
+  // Serial.println(rawMagHeading);
+  //Serial.println(offsetMag);
 }
 
-boolean new_gyro , dmp_on;
+volatile boolean new_gyro ;
 boolean startup = true;
 int  startupPhase = 0;
 int  startupSamples;
 
+#define PITCH 1
+#define ROLL  2
+#define YAW   0
+
 void loop()
 {
   unsigned char sensor_data;
+  short gyro[3], accel[3], sensors;
+  unsigned char more ;
+  unsigned char magSampled ;
+  long quat[4];
+
+  //Loop until MPU interrupts us with a reading
+  while (!new_gyro)
+    ;
 
   nowMillis = millis();
 
-  // If the MPU Interrupt occurred, read the fifo and process the data
-  if ((new_gyro && dmp_on)  )
+  sensor_data = 1;
+  dmp_read_fifo(gyro, accel, quat, &sensor_data, &sensors, &more);
+
+  if (!more)
+    new_gyro = false;
+
+  if (sensor_data == 0)
   {
-    short gyro[3], accel[3], sensors;
-    unsigned char more ;
-    unsigned char magSampled ;
-    long quat[4];
-    sensor_data = 1;
-    dmp_read_fifo(gyro, accel, quat, &sensor_data, &sensors, &more);
+    Quaternion q( (float)quat[0]  / 1073741824.0f,
+                  (float)quat[1]  / 1073741824.0f,
+                  (float)quat[2]  / 1073741824.0f,
+                  (float)quat[3]  / 1073741824.0f);
 
-    if (!more)
-      new_gyro = false;
+    // Calculate Yaw/Pitch/Roll
+    // Update client with yaw/pitch/roll and tilt-compensated magnetometer data
 
-    if (sensor_data == 0)
+    float newv[3];
+    //roll
+    newv[2] =  atan2(2.0 * (q.y * q.z + q.w * q.x), q.w * q.w - q.x * q.x - q.y * q.y + q.z * q.z);
+
+    // pitch
+    newv[1] = -asin(-2.0 * (q.x * q.z - q.w * q.y));
+
+    //yaw
+    newv[0] = -atan2(2.0 * (q.x * q.y + q.w * q.z), q.w * q.w + q.x * q.x - q.y * q.y - q.z * q.z);
+
+    short mag[3];
+    magSampled  = mpu_get_compass_reg(mag);
+
+    if (magSampled == 0)
     {
-      Quaternion q( (float)quat[0]  / 1073741824.0f,
-                    (float)quat[1]  / 1073741824.0f,
-                    (float)quat[2]  / 1073741824.0f,
-                    (float)quat[3]  / 1073741824.0f);
 
-      // Calculate Yaw/Pitch/Roll
-      // Update client with yaw/pitch/roll and tilt-compensated magnetometer data
+      if (outputUI)
+        reportRawMag(mag);
 
-      float newv[3];
-      //roll
-      newv[2] =  atan2(2.0 * (q.y * q.z + q.w * q.x), q.w * q.w - q.x * q.x - q.y * q.y + q.z * q.z);
+      float ox = (float)mag[0] - magOffset[0] ;
+      float oy = (float)mag[1] - magOffset[1] ;
+      float oz = (float)mag[2] - magOffset[2] ;
 
-      // pitch
-      newv[1] = -asin(-2.0 * (q.x * q.z - q.w * q.y));
+      float rx = ox * magXform[0] + oy * magXform[1] + oz * magXform[2];
+      float ry = ox * magXform[3] + oy * magXform[4] + oz * magXform[5];
+      float rz = ox * magXform[6] + oy * magXform[7] + oz * magXform[8];
 
-      //yaw
-      newv[0] = -atan2(2.0 * (q.x * q.y + q.w * q.z), q.w * q.w + q.x * q.x - q.y * q.y - q.z * q.z);
+      //  pitch/roll adjusted mag heading
+      rawMagHeading = wrap(atan2(-(rz * sin(newv[PITCH]) - ry * cos(newv[PITCH])),
+                                 rx * cos(newv[ROLL]) +
+                                 ry * sin(-newv[ROLL]) * sin(newv[PITCH]) +
+                                 rz * sin(-newv[ROLL]) * cos(newv[PITCH])) * -10430.06);
 
-      short mag[3];
-      magSampled  = mpu_get_compass_reg(mag);
-      
-      if (magSampled == 0)
-      {
+      magHeading = rawMagHeading;
 
-        if (outputUI)
-          reportRawMag(mag);
-
-        float ox = (float)mag[0] - magOffset[0] ;
-        float oy = (float)mag[1] - magOffset[1] ;
-        float oz = (float)mag[2] - magOffset[2] ;
-
-        float rx = ox * magXform[0] + oy * magXform[1] + oz * magXform[2];
-        float ry = ox * magXform[1] + oy * magXform[3] + oz * magXform[4];
-        float rz = ox * magXform[2] + oy * magXform[4] + oz * magXform[5];
-
-        //  pitch/roll adjusted mag heading
-
-        magHeading = wrap(atan2(-(rz * sin(newv[1]) - ry * cos(newv[1])),
-                                rx * cos(-newv[2]) +
-                                ry * sin(-newv[2]) * sin(newv[1]) +
-                                rz * sin(-newv[2]) * cos(newv[1]))) * -10430.06;
-        
-        // Auto Gyro Calibration
-        if (startup)
-        {
-          blink();
-          //parseInput();
-
-          if (startupPhase == 0)
-          {
-            for (int n = 0; n < 3; n++)
-              gBias[n] = avgGyro[n] = 0;
-
-            mpu_set_gyro_bias_reg(gBias);
-            startupPhase = 1;
-            startupSamples = 500;
-            return;
-          }
-
-          if (startupPhase == 1)
-          {
-            if (startupSamples == 0)
-            {
-              for (int n = 0; n < 3; n++)
-              {
-                gBias[n] = (avgGyro[n] / -250);
-              }
-              xDriftComp = 0.0;
-              mpu_set_gyro_bias_reg(gBias);
-              startupPhase = 2;
-              startupSamples = 0;
-              lastDriftX = newv[0];
-              //return;
-            }
-            else
-            {
-              for (int n = 0; n < 3; n++)
-                avgGyro[n] += gyro[n];
-            }
-            startupSamples --;
-            return ;
-          }
-
-          if (startupPhase == 2)
-          {
-            if (startupSamples == 1500)
-            {
-              xDriftComp = (newv[0] - lastDriftX) * 69.53373;
-              startup = false;
-              recenter();
-            }
-            startupSamples++;
-            return ;
-          }
-        }
-      }
-
-      //scale +/- PI to +/- 32767
-      for (int n = 0; n < 3; n++)
-        newv[n] = newv[n]   * 10430.06;
-        
-      // move to pre-calibrate
-      if (!calibrated)
-      {
-        if (sampleCount < recalibrateSamples)
-        { // accumulate samples
-
-          for (int n = 0; n < 3; n++)
-            c[n] += newv[n];
-
-          c[3] += magHeading;
-          sampleCount ++;
-        }
-        else
-        {
-          calibrated = true;
-
-          for (int n = 0; n < 4; n++)
-            c[n] = c[n] / (float)sampleCount;
-
-          //dX = 0.0;//dY = dZ = 0.0;
-          driftSamples = -2;
-          recalibrateSamples = 16000;//  calibration next time around
-          if (outputUI )
-          {
-            sendInfo();
-          }
-        }
-        return;
-      }
-
-      // Have we been asked to recalibrate ?
-      if (digitalRead(BUTTON_PIN) == LOW)
-      {
-        recenter();
-        return;
-      }
-
-      // apply drift offsets
-      for (int n = 0; n < 3; n++)
-        newv[n] = newv[n] - c[n];
-
-      // this should take us back to zero BUT we may have wrapped so ..
-      if (newv[0] < -32768.0)
-        newv[0] += 65536.0;
-
-      if (newv[0] > 32768.0)
-        newv[0] -= 65536.0 ;
-        
-      // for (int n = 0; n < 3; n++)
-      // newv[n] = constrain(newv[n], -16383.0, 16383.0);
-
-      if (magSampled == 0)
-      {
+      if (calibrated)
         magHeading = magHeading - c[3];
-      }
 
-      long ii[3];
-      
-      for (int n = 0; n < 3; n++)
-      {
-        if (expScaleMode) {
-          ii[n] =(long) (0.000122076 * newv[n] * newv[n] * scaleF[n]) * (newv[n] / abs(newv[n]));
-        }
-        else
-        {
-          // and scale to out target range plus a 'sensitivity' factor;
-          ii[n] = (long)(newv[n] * scaleF[n] );
-        }
-      }
+      if (offsetMag)
+        magHeading = magHeading + 32768.0;
 
-      // clamp after scaling to keep values within 16 bit range
-      for (int n = 0; n < 3; n++)
-        ii[n] = constrain(ii[n], -32767, 32767);
-        
-      // Do it to it.
-      if (abs(ii[0] ) > 30000)
-            joySt.xAxis = ii[0] ;
-      else
-        joySt.xAxis = joySt.xAxis * outputLPF + ii[0] * (1.0 - outputLPF) ;
-        
-      joySt.yAxis = joySt.yAxis * outputLPF + ii[1] * (1.0 - outputLPF) ;
-      joySt.zAxis = joySt.zAxis * outputLPF + ii[2] * (1.0 - outputLPF) ;
+      magHeading = wrap(magHeading);
 
-      Tracker.setState(&joySt);
-
-      //reports++;
-      if (outputUI )
-      {
-        Serial.print(joySt.xAxis);
-        //Serial.print(magHeading);
-        printtab();
-        Serial.print(joySt.yAxis);
-        printtab();
-        Serial.print(joySt.zAxis);
-        printtab();
-
-        tripple(accel);
-        tripple(gyro);
-        Serial.println("");
-      }
-
-      if (nowMillis > lastUpdate)
+      // Auto Gyro Calibration
+      if (startup)
       {
         blink();
+        parseInput();
 
-        // apply drift compensation
-        c[0] = c[0] + xDriftComp;
-
-        //handle wrap
-        if (c[0] > 65536.0)
-          c[0] = c[0] - 65536.0;
-        else if (c[0] < -65536.0 )
-          c[0] = c[0] + 65536.0;
-
-        lastUpdate = nowMillis + 100;
-        lastDriftX = newv[0];
-
-        long tempNow;
-
-        mpu_get_temperature (&tempNow);
-        if (outputUI )
+        if (startupPhase == 0)
         {
-          Serial.print("T\t");
-          Serial.println(tempNow);
+          for (int n = 0; n < 3; n++)
+            gBias[n] = avgGyro[n] = 0;
+
+          mpu_set_gyro_bias_reg(gBias);
+          startupPhase = 1;
+          startupSamples = 500;
+          return;
         }
-      }
 
-     // magHeading = constrain (magHeading, -32767, 32767);
-
-      if (//magHeading != lastMagHeading  &&
-          // abs(magHeading) < 10000  &&
-           abs(newv[1]) < 6000.0
-         )
-      {
-        lastMagHeading = magHeading;
-
-        // Mag is so noisy on 9150 we just ask 'is Mag ahead or behind DMP'
-        // and keep a count of consecutive behinds or aheads and use this 
-        // to adjust our DMP heading and also tweak the DMP drift
-        float delta = magHeading - newv[0];
-        
-        if (delta > 32768.0)
-          delta = 65536.0 - delta;
-        else if (delta < -32767)
-          delta = 65536.0 + delta;
-
-        if (delta > 0.0)
+        if (startupPhase == 1)
         {
-          if (behind )
+          if (startupSamples == 0)
           {
-            consecCount --;
+            for (int n = 0; n < 3; n++)
+            {
+              gBias[n] = (avgGyro[n] / -250);
+            }
+            xDriftComp = 0.0;
+            mpu_set_gyro_bias_reg(gBias);
+            startupPhase = 2;
+            startupSamples = 0;
+            lastDriftX = newv[0];
+            //return;
           }
           else
           {
-            consecCount = 0;
+            for (int n = 0; n < 3; n++)
+              avgGyro[n] += gyro[n];
           }
-          behind = true;
+          startupSamples --;
+          return ;
+        }
+
+        if (startupPhase == 2)
+        {
+          if (startupSamples == 1500)
+          {
+            xDriftComp = (newv[0] - lastDriftX) * 69.53373;
+            startup = false;
+            recenter();
+            Serial.println("H"); // Hello
+          }
+          startupSamples++;
+          return ;
+        }
+      }
+    }
+
+    //scale +/- PI to +/- 32767
+    for (int n = 0; n < 3; n++)
+      newv[n] = newv[n]   * 10430.06;
+
+    // move to pre-calibrate
+    if (!calibrated)
+    {
+      if (sampleCount < recalibrateSamples)
+      { // accumulate samples
+        for (int n = 0; n < 3; n++)
+          c[n] += newv[n];
+
+        c[3] += magHeading;
+        sampleCount ++;
+      }
+      else
+      {
+        calibrated = true;
+        for (int n = 0; n < 4; n++)
+          c[n] = c[n] / (float)sampleCount;
+        if (offsetMag)
+          c[3] = c[3] - 32768.0;
+        offsetMag = false;
+
+        //dX = 0.0;//dY = dZ = 0.0;
+        driftSamples = -2;
+        recalibrateSamples = 100;//  calibration next time around
+        if (outputUI )
+        {
+          sendInfo();
+        }
+      }
+      return;
+    }
+
+    // apply drift offsets
+    for (int n = 0; n < 3; n++)
+      newv[n] = newv[n] - c[n];
+
+    // this should take us back to zero BUT we may have wrapped so ..
+    if (newv[0] < -32768.0)
+      newv[0] += 65536.0;
+
+    if (newv[0] > 32768.0)
+      newv[0] -= 65536.0 ;
+
+    long ii[3];
+
+    for (int n = 0; n < 3; n++)
+    {
+      if (expScaleMode) {
+        ii[n] = (long) (0.000122076 * newv[n] * newv[n] * scaleF[n]) * (newv[n] / abs(newv[n]));
+      }
+      else
+      {
+        // and scale to out target range plus a 'sensitivity' factor;
+        ii[n] = (long)(newv[n] * scaleF[n] );
+      }
+    }
+
+    // clamp after scaling to keep values within 16 bit range
+    for (int n = 0; n < 3; n++)
+      ii[n] = constrain(ii[n], -32767, 32767);
+
+    // Do it to it.
+    if (ii[0] > 30000  || ii[0] < -30000)
+      joySt.xAxis = ii[0] ;
+    else
+      joySt.xAxis = joySt.xAxis * outputLPF + ii[0] * (1.0 - outputLPF) ;
+
+    joySt.yAxis = joySt.yAxis * outputLPF + ii[1] * (1.0 - outputLPF) ;
+    joySt.zAxis = joySt.zAxis * outputLPF + ii[2] * (1.0 - outputLPF) ;
+
+    Tracker.setState(&joySt);
+
+    // Have we been asked to recalibrate ?
+    if (digitalRead(BUTTON_PIN) == LOW)
+    {
+      recenter();
+      // return;
+    }
+
+    //reports++;
+    if (outputUI )
+    {
+      Serial.print(joySt.xAxis);
+      printtab();
+      Serial.print(joySt.yAxis);
+      printtab();
+      Serial.print(joySt.zAxis);
+      printtab();
+
+      tripple(accel);
+      tripple(gyro);
+      /*
+              Serial.print((int)rawMagHeading ); //
+              printtab();
+              Serial.print((int)magHeading  );
+              printtab();
+              Serial.print((int)c[3] ); //
+              printtab();
+      */
+      Serial.println("");
+
+    }
+
+    if (nowMillis > lastUpdate)
+    {
+      blink();
+
+      // apply drift compensation
+      c[0] = c[0] + xDriftComp;
+
+      //handle wrap
+      if (c[0] > 65536.0)
+        c[0] = c[0] - 65536.0;
+      else if (c[0] < -65536.0 )
+        c[0] = c[0] + 65536.0;
+
+      lastUpdate = nowMillis + 100;
+      lastDriftX = newv[0];
+
+      long tempNow;
+
+      mpu_get_temperature (&tempNow);
+      if (outputUI )
+      {
+        Serial.print("T\t");
+        Serial.println(tempNow);
+      }
+    }
+
+    // magHeading = constrain (magHeading, -32767, 32767);
+
+    if (//magHeading != lastMagHeading  &&
+      // abs(magHeading) < 10000  &&
+      newv[1] < 6000.0  && newv[1] > -6000.0
+    )
+    {
+      lastMagHeading = magHeading;
+
+      // Mag is so noisy on 9150 we just ask 'is Mag ahead or behind DMP'
+      // and keep a count of consecutive behinds or aheads and use this
+      // to adjust our DMP heading and also tweak the DMP drift
+      float delta = magHeading - newv[0];
+
+      if (delta > 32768.0)
+        delta = 65536.0 - delta;
+      else if (delta < -32767)
+        delta = 65536.0 + delta;
+
+      if (delta > 0.0)
+      {
+        if (behind )
+        {
+          consecCount --;
         }
         else
         {
-          if (!behind)
-          {
-            consecCount  ++;
-          }
-          else
-          {
-            consecCount = 0;
-          }
-          behind = false;
+          consecCount = 0;
         }
-
-        // Tweek the yaw offset. 0.01 keeps the head central with no visible twitching
-        c[0] = c[0] + (float)(consecCount * abs(consecCount)) * 0.012;
-
-        //Also tweak the overall drift compensation.
-        //DMP still suffers from 'warm-up' issues and this helps greatly.
-        xDriftComp = xDriftComp + (float)(consecCount) * 0.00001;
+        behind = true;
       }
-      parseInput();
+      else
+      {
+        if (!behind)
+        {
+          consecCount  ++;
+        }
+        else
+        {
+          consecCount = 0;
+        }
+        behind = false;
+      }
+
+      // Tweek the yaw offset. 0.01 keeps the head central with no visible twitching
+      c[0] = c[0] + (float)(consecCount * abs(consecCount)) * 0.012;
+
+      //Also tweak the overall drift compensation.
+      //DMP still suffers from 'warm-up' issues and this helps greatly.
+      xDriftComp = xDriftComp + (float)(consecCount) * 0.00001;
     }
+    parseInput();
   }
+
 }
 
 
@@ -590,7 +619,10 @@ void parseInput()
     }
     else if (command == 'H')
     {
-      Serial.println("H"); // Hello
+      if (startup)
+        Serial.println("h");
+      else
+        Serial.println("H"); // Hello
     }
     else if (command == 't')
     {
@@ -606,8 +638,8 @@ void parseInput()
       sendInfo();
       scl();
       outputUI = true;
-      if (DEFAULT_MPU_HZ > 101)
-        dmp_set_fifo_rate(DEFAULT_MPU_HZ / 2);
+      // if (DEFAULT_MPU_HZ > 101)
+      dmp_set_fifo_rate(DEFAULT_MPU_HZ / 2);
       reportRawMagMatrix();
     }
     else if (command == 'I')
@@ -664,7 +696,7 @@ void parseInput()
         EEPROM.write(EE_MAGOFFX + i, data );
       }
 
-      for (int i = 0 ; i < 24 ; i++) // 12 + 12 is raw mag xform then orientated xform
+      for (int i = 0 ; i < 36 ; i++) // 18 + 18 is raw mag xform then orientated xform
       {
         data = Serial.read();
         EEPROM.write(EE_MAGXFORM + i, data );
@@ -697,12 +729,12 @@ ISR(INT6_vect) {
 
 void initialize_mpu() {
   mpu_init(&revision);
-   mpu_set_compass_sample_rate(100); // defaults to 100 in the libs
+  mpu_set_compass_sample_rate(100); // defaults to 100 in the libs
 
   /* Get/set hardware configuration. Start gyro. Wake up all sensors. */
   mpu_set_sensors(INV_XYZ_GYRO | INV_XYZ_ACCEL | INV_XYZ_COMPASS);
-  mpu_set_gyro_fsr (2000);//250
-  mpu_set_accel_fsr(2);//4
+  //  mpu_set_gyro_fsr (2000);//250
+  //  mpu_set_accel_fsr(2);//4
 
   /* Push both gyro and accel data into the FIFO. */
   mpu_configure_fifo(INV_XYZ_GYRO | INV_XYZ_ACCEL);
@@ -726,7 +758,6 @@ void initialize_mpu() {
 
 void disable_mpu() {
   mpu_set_dmp_state(0);
-  dmp_on = false;
   EIMSK &= ~(1 << INT6);      //deactivate interupt
 }
 
@@ -734,7 +765,6 @@ void enable_mpu() {
   EICRB |= (1 << ISC60) | (1 << ISC61); // sets the interrupt type for EICRB (INT6)
   EIMSK |= (1 << INT6); // activates the interrupt. 6 for 6, etc
   mpu_set_dmp_state(1);  // This enables the DMP; at this point, interrupts should commence
-  dmp_on = true;
 }
 
 void blink()
@@ -751,6 +781,7 @@ void blink()
       lastMillis = nowMillis + 500;
   }/**/
 }
+
 
 void tripple(short * v)
 {
@@ -800,6 +831,8 @@ void setScales()
     EEPROM.write(EE_PITCHSCALE, (int)(scaleF[1] * 4));
   }
   scaleF[2] = scaleF[1];
+
+  writeIntEE(EE_LPF, (int)(outputLPF * 32767.0));
 }
 
 void sendBool(char x, boolean v)
@@ -854,7 +887,7 @@ void reportRawMagMatrix()
     printtab();
   }
   //raw mag calibration
-  for (int i = 6; i < 12 ; i++)
+  for (int i = 9; i < 18 ; i++)
   {
     Serial.print( magXform[i], 13);
     printtab();
@@ -883,7 +916,7 @@ loadMagCalibration()
     magOffset[i] = (float)readIntEE(EE_MAGOFFX + (i * 2)) / 64.0;
   }
 
-  for (int i = 0; i < 12 ; i ++)//orientated then raw
+  for (int i = 0; i < 18 ; i ++)//orientated then raw
   {
     magXform[i] = (float)readIntEE(EE_MAGXFORM + i * 2) / 8192.0;
   }
@@ -896,5 +929,5 @@ loadSettings()
   orientation = constrain(EEPROM.read(EE_ORIENTATION), 0, 3);
   expScaleMode = EEPROM.read(EE_EXPSCALEMODE);
   getScales();
-  xDriftComp = (float)readIntEE(EE_XDRIFTCOMP) / 256.0;
+  outputLPF = (float)readIntEE(EE_LPF) / 32767.0;
 }

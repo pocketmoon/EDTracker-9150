@@ -101,6 +101,7 @@ void  mpu_set_accel_bias_6050_reg(const long *accel_bias, unsigned char relative
 
 void  mpu_read_6050_accel_bias(long *accel_bias);
 
+void mpu_set_sleep_mode(unsigned char state) ;
 
 
 uint8_t mpu_get_fifo_config(unsigned char *sensors);
@@ -115,7 +116,7 @@ void  mpu_set_accel_bias(const long *accel_bias);
 void mpu_get_gyro_reg(short *data, unsigned long *timestamp);
 void mpu_get_accel_reg(short *data, unsigned long *timestamp);
 
-uint8_t mpu_get_compass_reg(short *data, unsigned long *timestamp);
+uint8_t mpu_get_compass_reg(short *data);
 uint8_t mpu_get_temperature(long *data);
 
 uint8_t mpu_get_int_status(short *status);

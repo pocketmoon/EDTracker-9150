@@ -17,12 +17,9 @@
  *                  MPU9150 (or MPU6050 w/ AK8975 on the auxiliary bus)
  *                  MPU9250 (or MPU6500 w/ AK8963 on the auxiliary bus)
  */
- 
-#define EMPL_TARGET_ATMEGA328
-#define MPU6050 
-//#define MPU9150
 
- 
+#define EMPL_TARGET_ATMEGA328
+  
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -2680,7 +2677,18 @@ static int setup_compass(void)
 #endif
 }
 
-
+void mpu_set_sleep_mode(unsigned char state) {
+    char data;
+    
+	i2c_write(st.hw->addr, st.reg->pwr_mgmt_1, 1, data);
+    
+	if (state == 1)
+        data |= 1<<6;
+    else
+        data &= ~(1<<6);
+    
+	i2c_write(st.hw->addr, st.reg->pwr_mgmt_1, 1, data);
+}
 
 /**
  *  @brief      Read raw compass data.
@@ -2688,7 +2696,7 @@ static int setup_compass(void)
  *  @param[out] timestamp   Timestamp in milliseconds. Null if not needed.
  *  @return     0 if successful.
  */
-uint8_t mpu_get_compass_reg(short *data, unsigned long *timestamp)
+uint8_t mpu_get_compass_reg(short *data)
 {
 #ifdef AK89xx_SECONDARY
     unsigned char tmp[9];
@@ -2724,12 +2732,12 @@ uint8_t mpu_get_compass_reg(short *data, unsigned long *timestamp)
     data[1] = (tmp[4] << 8) | tmp[3];
     data[2] = (tmp[6] << 8) | tmp[5];
 	
-    data[0] = ((long)data[0] * st.chip_cfg.mag_sens_adj[0]) >> 8;
-    data[1] = ((long)data[1] * st.chip_cfg.mag_sens_adj[1]) >> 8;
-    data[2] = ((long)data[2] * st.chip_cfg.mag_sens_adj[2]) >> 8;
+    //data[0] = ((long)data[0] * st.chip_cfg.mag_sens_adj[0]) >> 8;
+    //data[1] = ((long)data[1] * st.chip_cfg.mag_sens_adj[1]) >> 8;
+    //data[2] = ((long)data[2] * st.chip_cfg.mag_sens_adj[2]) >> 8;
 
-    if (timestamp)
-        get_ms(timestamp);
+    //if (timestamp)
+      //  get_ms(timestamp);
     return 0;
 #else
     return 99;
